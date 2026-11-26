@@ -1,0 +1,86 @@
+name: android-ci
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  android-instrumented:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ORDO_MIRRORS: "off"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Checkout private source
+        env:
+          SRC_TOKEN: ${{ secrets.ORDO_SRC_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${SRC_TOKEN}@github.com/TririLi/triri-ordo.git" src
+          cd src && git log --oneline -1
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK components
+        run: |
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "${ANDROID_SDK_ROOT}" /usr/local/lib/android/sdk -name sdkmanager -type f 2>/dev/null | head -1)"
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" >/dev/null
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || true
+
+      - name: Emulator libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpulse0 libglu1-mesa
+
+      - name: Instrumented tests (Agent MCP e2e + schema/dao)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          disable-linux-hw-accel: false
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -no-snapshot -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none -camera-front none
+          working-directory: src/android
+          script: |
+            chmod +x gradlew
+            ./gradlew connectedDebugAndroidTest --no-daemon --stacktrace
+            echo "==== logcat ===="
+            adb logcat -d -s OrdoAgent:V OrdoAgentE2e:V TestRunner:V AndroidRuntime:E | tail -250 || true
+
+      - name: Dump androidTest failures
+        if: always()
+        run: |
+          echo "==== androidTest failures ===="
+          python3 - <<'PYEOF'
+          import glob, xml.etree.ElementTree as ET
+          for f in glob.glob('src/android/app/build/outputs/androidTest-results/**/*.xml', recursive=True):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print('parse fail', f, e)
+                  continue
+              for tc in root.iter('testcase'):
+                  for fail in list(tc.iter('failure')) + list(tc.iter('error')):
+                      print('====', tc.get('classname'), tc.get('name'))
+                      print((fail.text or '')[:3000])
+          PYEOF

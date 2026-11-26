@@ -1,0 +1,61 @@
+name: node-gate
+
+# 私仓 Actions 被账单拦截，node 侧门禁（C1/C3/自测/夹具）实际靠这个公共镜像仓代跑。
+# 触发方式：向本仓 push（克隆私仓最新 main 后执行），或手动 workflow_dispatch。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  node-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout private source
+        env:
+          SRC_TOKEN: ${{ secrets.ORDO_SRC_TOKEN }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${SRC_TOKEN}@github.com/TririLi/triri-ordo.git" src
+          cd src && git log --oneline -1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: C1 跨端 core 导出对账
+        working-directory: src
+        run: node scripts/check-core-parity.mjs
+
+      - name: C3 单一源生成校验（ETS → Windows）
+        working-directory: src
+        run: node scripts/gen-core-ts.mjs --check
+
+      - name: 三端夹具一致性（golden = 安卓 = Windows）
+        working-directory: src
+        run: |
+          set -e
+          node scripts/gen-widget-fixtures.mjs --check
+          FIXTURES="android/app/src/test/resources/widget-cases.json windows/tests/fixtures/widget-cases.json"
+          git add -N -- $FIXTURES
+          git diff --exit-code -- $FIXTURES
+          echo "OK: 三份小组件夹具同口径（golden = 安卓 = Windows）"
+
+      - name: 逻辑自测（scripts/*-selftest.mjs × 双时区）
+        working-directory: src
+        run: |
+          fail=0
+          for f in scripts/*-selftest.mjs; do
+            for tz in Asia/Shanghai UTC; do
+              if ! TZ=$tz node "$f" > /tmp/nodegate.txt 2>&1; then
+                echo "::error::FAIL [$tz] $f"; tail -25 /tmp/nodegate.txt; fail=1
+              elif ! grep -qE 'FAIL[ =]0' /tmp/nodegate.txt; then
+                echo "::error::FAIL [$tz] $f（断言计数非 0）"; tail -25 /tmp/nodegate.txt; fail=1
+              fi
+            done
+          done
+          echo "node-gate: fail=$fail"
+          exit $fail
